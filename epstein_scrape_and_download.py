@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """
-DOJ Epstein Data Set scraper + downloader (pagination-aware, resilient navigation).
+DOJ Epstein Data Set scraper + downloader (pagination-aware, hardened against age-verify re-prompts).
 
-Key capabilities:
-- Scrapes Data Set 1..12 index pages and all pagination (?page=1, ?page=2, ...)
-- Collects all listed PDF links, deduplicated
-- Downloads PDFs using browser navigation with Referer (more stable than direct fetch)
-- Handles DOJ age verification flow and persists session state (storage_state.json)
-- Resume-safe: skips already-downloaded files, atomic writes via .part files
-- Robust navigation: retries and uses wait_until="domcontentloaded" to avoid net::ERR_ABORTED issues.
-
-Usage example (recommended first run headed):
-  python epstein_scrape_and_download.py --out "./doj_epstein_pdfs" --headed --use-chrome-channel
-
-Then headless:
-  python epstein_scrape_and_download.py --out "./doj_epstein_pdfs" --headless
+Enhancements over earlier versions:
+- Pagination across dataset index pages (?page=N)
+- Robust navigation with retries (domcontentloaded, not networkidle)
+- If a PDF request is redirected to /age-verify?destination=..., the script clicks "Yes" on THAT page
+  and retries the same PDF URL immediately (most reliable pattern).
+- Resource blocking to reduce flakiness.
+- Resume-safe: skips existing non-empty files; atomic .part writes.
+- Persists browser storage state to storage_state.json.
 """
 
 from __future__ import annotations
@@ -38,9 +33,8 @@ from playwright.sync_api import (
 
 ROOT = "https://www.justice.gov"
 EPSTEIN_HOME = f"{ROOT}/epstein"
-DATASET_LISTING_BASE = f"{ROOT}/epstein/doj-disclosures/data-set-{{n}}-files"
+DATASET_LISTING_BASE = f"{ROOT}/epstein/_doj-disclosures/data-set-{{n}}-files"
 
-# Match: https://www.justice.gov/epstein/files/DataSet%201/EFTA00000001.pdf
 PDF_RE = re.compile(r"/epstein/files/DataSet%20(\d+)/EFTA(\d{8})\.pdf$", re.IGNORECASE)
 
 
@@ -51,7 +45,6 @@ def log_factory(log_path: Path):
         print(line, flush=True)
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
-
     return log
 
 
@@ -70,7 +63,7 @@ def try_click_yes(page: Page) -> bool:
     ]
     for sel in selectors:
         try:
-            page.locator(sel).first.click(timeout=5000)
+            page.locator(sel).first.click(timeout=8000)
             return True
         except Exception:
             continue
@@ -100,36 +93,35 @@ def safe_goto(
     referer: Optional[str] = None,
     timeout_ms: int = 60000,
     retries: int = 6,
-) -> None:
+) -> Optional[Response]:
     """
-    Robust navigation helper.
-    - Uses domcontentloaded instead of networkidle (avoids net::ERR_ABORTED on noisy pages)
-    - Retries transient failures with backoff/jitter
+    Robust navigation helper that returns the Response (if available).
+    Uses domcontentloaded (less brittle than networkidle).
+    Retries transient failures (ERR_ABORTED, timeouts, etc).
     """
     last_err: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms, referer=referer)
-            return
+            resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms, referer=referer)
+            return resp
         except (PlaywrightTimeoutError, Exception) as e:
             last_err = e
             log(f"WARNING: goto failed (attempt {attempt}/{retries}) url={url} err={e}")
-            # Exponential-ish backoff with jitter (caps to avoid excessive delay)
-            time.sleep(min(10.0, (1.3**attempt)) + random.random())
+            time.sleep(min(10.0, (1.3 ** attempt)) + random.random())
             try:
                 page.wait_for_timeout(200)
             except Exception:
                 pass
-    raise last_err if last_err else RuntimeError(f"safe_goto failed for {url}")
+    if last_err:
+        raise last_err
+    return None
 
 
-def ensure_age_verified(page: Page, context: BrowserContext, storage_state_path: Path, log) -> None:
+def ensure_age_verified_home(page: Page, context: BrowserContext, storage_state_path: Path, log) -> None:
     """
-    Visit Epstein home page and pass age verification if encountered.
-    Persist storage state after the check so subsequent runs reuse it.
+    Verify age via the Epstein home page (useful up-front).
     """
     safe_goto(page, EPSTEIN_HOME, log)
-
     if is_age_verify_url(page.url):
         log(f"Age verification encountered at {page.url}. Attempting to click 'Yes'.")
         clicked = try_click_yes(page)
@@ -145,18 +137,38 @@ def ensure_age_verified(page: Page, context: BrowserContext, storage_state_path:
     log(f"Saved storage state to: {storage_state_path}")
 
 
+def satisfy_age_verify_if_present(page: Page, context: BrowserContext, storage_state_path: Path, log) -> bool:
+    """
+    If the current page is an age-verify page, click Yes and save storage state.
+    Returns True if it performed a click, else False.
+    """
+    if not is_age_verify_url(page.url):
+        return False
+
+    log(f"Age-verify page detected during PDF fetch: {page.url} — clicking 'Yes' and continuing.")
+    clicked = try_click_yes(page)
+    if not clicked:
+        log("WARNING: Could not auto-click 'Yes' on age-verify. Run with --headed once.")
+        return False
+
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=30000)
+    except Exception:
+        pass
+
+    storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+    context.storage_state(path=str(storage_state_path))
+    log(f"Saved storage state to: {storage_state_path}")
+    return True
+
+
 def extract_pdf_links_from_current_page(page: Page, dataset_n: int) -> List[Tuple[str, str]]:
-    """
-    Extract all matching PDF links from the current page.
-    Returns list of (filename, absolute_url).
-    """
     hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.getAttribute('href'))")
     out: List[Tuple[str, str]] = []
 
     for h in hrefs:
         if not h:
             continue
-        # Restrict to Epstein PDF links
         if h.lower().endswith(".pdf") and "/epstein/files/dataset%20" in h.lower():
             abs_url = h if h.startswith("http") else (ROOT + h)
             m = PDF_RE.search(abs_url)
@@ -166,8 +178,7 @@ def extract_pdf_links_from_current_page(page: Page, dataset_n: int) -> List[Tupl
             if ds_from_url != dataset_n:
                 continue
             num = m.group(2)
-            filename = f"EFTA{num}.pdf"
-            out.append((filename, abs_url))
+            out.append((f"EFTA{num}.pdf", abs_url))
 
     return out
 
@@ -175,36 +186,22 @@ def extract_pdf_links_from_current_page(page: Page, dataset_n: int) -> List[Tupl
 def collect_pdf_links_for_dataset_paginated(
     page: Page,
     dataset_n: int,
+    context: BrowserContext,
+    storage_state_path: Path,
     log,
     max_pages: int = 5000,
     polite_sleep: float = 0.12,
 ) -> Dict[str, Tuple[str, str]]:
-    """
-    Scrape dataset listing page and its pagination:
-      base, ?page=1, ?page=2, ... until no NEW links found on a page (after page 0).
-
-    Returns:
-      filename -> (pdf_url, referer_url_where_found)
-    """
     base = DATASET_LISTING_BASE.format(n=dataset_n)
     collected: Dict[str, Tuple[str, str]] = {}
 
     for page_num in range(max_pages):
-        if page_num == 0:
-            idx_url = base
-        else:
-            idx_url = f"{base}?page={page_num}"
-
+        idx_url = base if page_num == 0 else f"{base}?page={page_num}"
         safe_goto(page, idx_url, log)
 
-        # If gated, verify and reload the index page
         if is_age_verify_url(page.url):
             log(f"Dataset {dataset_n} index redirected to age-verify at page={page_num}; verifying then retrying.")
-            try_click_yes(page)
-            try:
-                page.wait_for_load_state("domcontentloaded", timeout=30000)
-            except Exception:
-                pass
+            satisfy_age_verify_if_present(page, context, storage_state_path, log)
             safe_goto(page, idx_url, log)
 
         links = extract_pdf_links_from_current_page(page, dataset_n)
@@ -212,12 +209,11 @@ def collect_pdf_links_for_dataset_paginated(
         new_count = 0
         for fn, pdf_url in links:
             if fn not in collected:
-                collected[fn] = (pdf_url, idx_url)  # keep referer as the index page URL
+                collected[fn] = (pdf_url, idx_url)
                 new_count += 1
 
         log(f"Dataset {dataset_n}: index page={page_num} links={len(links)} new={new_count} total={len(collected)}")
 
-        # Stop when a paginated page yields no new links (after first page)
         if page_num > 0 and new_count == 0:
             break
 
@@ -226,54 +222,51 @@ def collect_pdf_links_for_dataset_paginated(
     return collected
 
 
-def nav_get_bytes(page: Page, url: str, referer: str, log) -> Tuple[int, str, str, bytes]:
+def fetch_pdf_with_age_verify_handling(
+    page: Page,
+    context: BrowserContext,
+    storage_state_path: Path,
+    pdf_url: str,
+    referer_url: str,
+    log,
+) -> Tuple[int, str, str, bytes]:
     """
-    Navigate to URL with Referer and return:
-      (status, final_url, content_type, body_bytes)
+    Fetch a PDF by navigation. If redirected to age-verify, click Yes on that page and retry once.
+    Returns (status, final_url, content_type, body).
+    """
+    resp = safe_goto(page, pdf_url, log, referer=referer_url)
+    final_url = page.url
 
-    Uses domcontentloaded + retry wrapper (safe_goto) to avoid ERR_ABORTED.
-    """
-    # We want the Response object for headers/body; safe_goto doesn't return it.
-    # We'll do a direct goto here with retries similar to safe_goto and capture Response.
-    last_err: Optional[Exception] = None
-    for attempt in range(1, 6 + 1):
+    if resp is None:
+        return (0, final_url, "", b"")
+
+    status = resp.status
+    ctype = resp.headers.get("content-type", "")
+    body = b""
+    if status < 400 and status != 204:
         try:
-            resp: Optional[Response] = page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=60000,
-                referer=referer,
-            )
+            body = resp.body()
+        except Exception:
+            body = b""
+
+    # If we landed on age-verify (HTML), satisfy it right there and retry the same PDF once.
+    if is_age_verify_url(final_url) or (status == 200 and "text/html" in (ctype or "").lower() and not looks_like_pdf(ctype, body[:8])):
+        satisfied = satisfy_age_verify_if_present(page, context, storage_state_path, log)
+        if satisfied:
+            resp2 = safe_goto(page, pdf_url, log, referer=referer_url)
             final_url = page.url
-            if resp is None:
+            if resp2 is None:
                 return (0, final_url, "", b"")
-            status = resp.status
-            ctype = resp.headers.get("content-type", "")
+            status = resp2.status
+            ctype = resp2.headers.get("content-type", "")
             body = b""
             if status < 400 and status != 204:
                 try:
-                    body = resp.body()
+                    body = resp2.body()
                 except Exception:
                     body = b""
-            return (status, final_url, ctype, body)
-        except (PlaywrightTimeoutError, Exception) as e:
-            last_err = e
-            log(f"WARNING: PDF goto failed (attempt {attempt}/6) url={url} err={e}")
-            time.sleep(min(10.0, (1.3**attempt)) + random.random())
-            try:
-                page.wait_for_timeout(200)
-            except Exception:
-                pass
-    raise last_err if last_err else RuntimeError(f"nav_get_bytes failed for {url}")
 
-
-def already_downloaded(out_dir: Path, dataset_n: int, filename: str) -> bool:
-    """
-    Skip rule:
-    - only skip if the destination file exists and is non-empty
-    """
-    dest = out_dir / f"DataSet_{dataset_n:02d}" / filename
-    return dest.exists() and dest.stat().st_size > 0
+    return (status, final_url, ctype, body)
 
 
 def main() -> int:
@@ -297,7 +290,6 @@ def main() -> int:
     storage_state_path = out_dir / "storage_state.json"
 
     headless = args.headless and not args.headed
-
     log(f"Starting scrape+download: out={out_dir} datasets={args.dataset_start}..{args.dataset_end} headless={headless}")
 
     with sync_playwright() as p:
@@ -334,10 +326,12 @@ def main() -> int:
 
         page.route("**/*", block_heavy)
 
-        ensure_age_verified(page, context, storage_state_path, log)
+        # Verify once up-front
+        ensure_age_verified_home(page, context, storage_state_path, log)
 
         total_links = 0
         downloaded = 0
+        skipped_existing = 0
         blocked_or_nonpdf = 0
 
         for ds in range(args.dataset_start, args.dataset_end + 1):
@@ -347,32 +341,30 @@ def main() -> int:
             mapping = collect_pdf_links_for_dataset_paginated(
                 page=page,
                 dataset_n=ds,
+                context=context,
+                storage_state_path=storage_state_path,
                 log=log,
                 max_pages=args.max_index_pages,
             )
 
-            # Sort by EFTA numeric id for readable progress
             items = sorted(mapping.items(), key=lambda kv: int(kv[0][4:12]))
             total_links += len(items)
-
             log(f"Dataset {ds}: total collected across pages = {len(items)}")
 
             for filename, (pdf_url, referer_url) in items:
                 dest = ds_dir / filename
                 if dest.exists() and dest.stat().st_size > 0:
+                    skipped_existing += 1
                     continue
 
-                status, final_url, ctype, body = nav_get_bytes(page, pdf_url, referer=referer_url, log=log)
-
-                # Handle age-verify bounce (HTML), then retry once
-                if is_age_verify_url(final_url) or (
-                    status == 200
-                    and "text/html" in (ctype or "").lower()
-                    and not looks_like_pdf(ctype, body[:8] if body else b"")
-                ):
-                    log(f"{filename}: got HTML/age-verify (status={status}, ctype={ctype}); re-verifying then retrying once.")
-                    ensure_age_verified(page, context, storage_state_path, log)
-                    status, final_url, ctype, body = nav_get_bytes(page, pdf_url, referer=referer_url, log=log)
+                status, final_url, ctype, body = fetch_pdf_with_age_verify_handling(
+                    page=page,
+                    context=context,
+                    storage_state_path=storage_state_path,
+                    pdf_url=pdf_url,
+                    referer_url=referer_url,
+                    log=log,
+                )
 
                 if status == 401:
                     blocked_or_nonpdf += 1
@@ -400,7 +392,7 @@ def main() -> int:
         context.storage_state(path=str(storage_state_path))
         browser.close()
 
-    log(f"Done. total_links={total_links} downloaded={downloaded} blocked_or_nonpdf={blocked_or_nonpdf}")
+    log(f"Done. total_links={total_links} downloaded={downloaded} skipped_existing={skipped_existing} blocked_or_nonpdf={blocked_or_nonpdf}")
     return 0
 
 
